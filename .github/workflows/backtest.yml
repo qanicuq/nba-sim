@@ -1,0 +1,41 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Download scores
+        run: python nba_sim.py download
+
+      - name: Download Kalshi
+        run: python nba_sim.py kalshi_download
+
+      - name: Run backtest
+        run: python nba_sim.py backtest
+
+      - name: Commit backtest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/games.csv data/kalshi_games.csv.gz settings.json backtest_results.md
+          git diff --cached --quiet || git commit -m "Update backtest"
+          git push
