@@ -240,6 +240,8 @@ def _close_dollars(book):
         return None
     raw = book.get("close_dollars")
     if raw is None or raw == "":
+        raw = book.get("close")
+    if raw is None or raw == "":
         return None
     try:
         return float(raw)
@@ -257,21 +259,35 @@ def _fee_multiplier():
     return fee_mult.get(SERIES, 1.0)
 
 
-def _settled_event_tickers(series):
+def _settled_markets():
+    markets = []
     cursor = ""
     while True:
-        url = f"{KALSHI}/events?series_ticker={series}&status=settled&limit=200"
+        url = f"{KALSHI}/historical/markets?series_ticker={SERIES}&limit=1000"
         if cursor:
             url += "&cursor=" + cursor
         payload = get_json(url)
         time.sleep(0.3)
-        for event in payload.get("events") or []:
-            ticker = event.get("event_ticker")
-            if ticker:
-                yield ticker
+        for market in payload.get("markets") or []:
+            market["historical"] = True
+            markets.append(market)
         cursor = payload.get("cursor") or ""
         if not cursor:
             break
+    cursor = ""
+    while True:
+        url = f"{KALSHI}/markets?series_ticker={SERIES}&status=settled&limit=1000"
+        if cursor:
+            url += "&cursor=" + cursor
+        payload = get_json(url)
+        time.sleep(0.3)
+        for market in payload.get("markets") or []:
+            market["historical"] = False
+            markets.append(market)
+        cursor = payload.get("cursor") or ""
+        if not cursor:
+            break
+    return markets
 
 
 def kalshi_download():
@@ -279,10 +295,15 @@ def kalshi_download():
     lookup = {}
     for row in games.itertuples(index=False):
         lookup[_event_code(row.away_team, row.home_team, row.gameday)] = row
+    grouped = {}
+    for market in _settled_markets():
+        event_ticker = market.get("event_ticker")
+        if event_ticker:
+            grouped.setdefault(event_ticker, []).append(market)
     rows = []
     unmatched = []
     seen = 0
-    for event_ticker in _settled_event_tickers(SERIES):
+    for event_ticker, markets in grouped.items():
         seen += 1
         code = event_ticker.split("-", 1)[1] if "-" in event_ticker else ""
         found = lookup.get(code)
@@ -291,21 +312,39 @@ def kalshi_download():
         else:
             tipoff = datetime.fromisoformat(str(found.tipoff_utc).replace("Z", "+00:00"))
             entry = int(tipoff.timestamp()) - 3600
-            payload = get_json(f"{KALSHI}/markets?event_ticker={event_ticker}&limit=1000")
-            time.sleep(0.3)
-            markets = payload.get("markets") or []
-            info = {}
-            tickers = []
+            historical = []
+            current = []
             for market in markets:
                 ticker = market.get("ticker")
                 if not ticker:
                     continue
-                info[ticker] = market
-                tickers.append(ticker)
-            for start in range(0, len(tickers), 100):
-                group = tickers[start:start + 100]
+                if market.get("historical"):
+                    historical.append(market)
+                else:
+                    current.append(market)
+            picked = []
+            for market in historical:
+                ticker = market["ticker"]
                 url = (
-                    f"{KALSHI}/markets/candlesticks?market_tickers={','.join(group)}"
+                    f"{KALSHI}/historical/markets/{ticker}/candlesticks"
+                    f"?start_ts={entry - 6 * 3600}&end_ts={entry}&period_interval=60"
+                )
+                payload = get_json(url)
+                time.sleep(0.3)
+                chosen = None
+                for candle in payload.get("candlesticks") or []:
+                    ts = candle.get("end_period_ts")
+                    if ts is None or ts > entry:
+                        continue
+                    if chosen is None or ts >= chosen["end_period_ts"]:
+                        chosen = candle
+                if chosen is not None:
+                    picked.append((market, chosen))
+            for start in range(0, len(current), 100):
+                group = current[start:start + 100]
+                info = {market["ticker"]: market for market in group}
+                url = (
+                    f"{KALSHI}/markets/candlesticks?market_tickers={','.join(info)}"
                     f"&start_ts={entry - 6 * 3600}&end_ts={entry}&period_interval=60"
                 )
                 candles = get_json(url)
@@ -322,24 +361,26 @@ def kalshi_download():
                             continue
                         if chosen is None or ts >= chosen["end_period_ts"]:
                             chosen = candle
-                    if chosen is None:
-                        continue
-                    yes_ask = _close_dollars(chosen.get("yes_ask"))
-                    if yes_ask is None:
-                        continue
-                    suffix = ticker.rsplit("-", 1)[-1]
-                    team = ESPN_FROM_KALSHI.get(suffix, suffix)
-                    if team != found.home_team and team != found.away_team:
-                        continue
-                    rows.append({
-                        "event_ticker": event_ticker,
-                        "ticker": ticker,
-                        "team": team,
-                        "game_id": str(found.game_id),
-                        "tipoff_utc": found.tipoff_utc,
-                        "result": market.get("result"),
-                        "yes_ask": yes_ask,
-                    })
+                    if chosen is not None:
+                        picked.append((market, chosen))
+            for market, chosen in picked:
+                ticker = market["ticker"]
+                yes_ask = _close_dollars(chosen.get("yes_ask"))
+                if yes_ask is None:
+                    continue
+                suffix = ticker.rsplit("-", 1)[-1]
+                team = ESPN_FROM_KALSHI.get(suffix, suffix)
+                if team != found.home_team and team != found.away_team:
+                    continue
+                rows.append({
+                    "event_ticker": event_ticker,
+                    "ticker": ticker,
+                    "team": team,
+                    "game_id": str(found.game_id),
+                    "tipoff_utc": found.tipoff_utc,
+                    "result": market.get("result"),
+                    "yes_ask": yes_ask,
+                })
         if seen % 50 == 0:
             print(f"{seen} events, {len(rows)} rows")
     os.makedirs("data", exist_ok=True)
@@ -367,12 +408,6 @@ def backtest():
     games = load_games()
     played = games["home_score"].notna() & games["away_score"].notna()
     train = games[games["season"].between(2016, 2022) & played]
-    train_scores = np.concatenate([
-        train["home_score"].to_numpy(dtype=float),
-        train["away_score"].to_numpy(dtype=float),
-    ])
-    S = float(np.std(train_scores, ddof=1))
-
     train_rows = train[
         ["home_team", "away_team", "gameday", "location", "home_score", "away_score"]
     ].to_dict("records")
@@ -393,6 +428,15 @@ def backtest():
                 best_mae = mae
                 best_n = N
                 best_h = H
+
+    misses = []
+    for game_row in train_rows:
+        home_exp, away_exp = expected_points(games, game_row, best_n, best_h)
+        if home_exp is None:
+            continue
+        miss = (float(game_row["home_score"]) - float(game_row["away_score"])) - (home_exp - away_exp)
+        misses.append(miss)
+    S = float(np.std(misses, ddof=1) / np.sqrt(2))
 
     with open("settings.json", "w", encoding="utf-8") as handle:
         json.dump({"N": best_n, "H": best_h, "S": S}, handle)
