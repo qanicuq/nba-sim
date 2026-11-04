@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import sys
@@ -57,6 +58,9 @@ def get_json(url):
                 time.sleep(2 * (attempt + 1))
                 continue
             raise
+        except (OSError, http.client.HTTPException):
+            time.sleep(2 * (attempt + 1))
+            continue
     raise RuntimeError("too many retries")
 
 
